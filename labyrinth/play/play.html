@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Labirinto contro l'IA</title>
+<style>
+  :root { --bg:#16151b; --panel:#22212a; --fg:#ece8df; --muted:#9a96a3; --accent:#ffd166; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  header { padding:10px 16px; background:var(--panel); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  main { display:flex; gap:16px; padding:16px; flex-wrap:wrap; align-items:flex-start; }
+  .card { background:var(--panel); border-radius:12px; padding:14px; }
+  canvas { display:block; max-width:100%; touch-action:manipulation; }
+  button, input, select { font:inherit; background:#2e2c38; color:var(--fg); border:1px solid #4a4756; border-radius:8px; padding:6px 10px; }
+  button { cursor:pointer; } button:hover { border-color:var(--accent); }
+  button.primary { background:#3b5bdb; border-color:#3b5bdb; }
+  .muted { color:var(--muted); }
+  .dot { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:6px; vertical-align:-1px; }
+  #side { width:320px; max-width:100%; display:flex; flex-direction:column; gap:12px; }
+  .player { padding:6px 0; border-bottom:1px solid #333; }
+  .player.active { color:var(--accent); }
+  .treasures { font-size:13px; color:var(--muted); }
+  #turn { font-size:18px; font-weight:600; }
+  #secret { font-size:22px; text-align:center; padding:14px; border:2px dashed #555; border-radius:10px; }
+  #setup .row { display:flex; gap:8px; margin:6px 0; align-items:center; }
+  #banner { font-size:22px; font-weight:700; color:var(--accent); }
+  #log { font-size:12px; color:var(--muted); max-height:140px; overflow:auto; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧭 Labirinto contro l'IA</h1>
+  <span class="muted" id="agentinfo"></span>
+  <button id="newbtn">Nuova partita</button>
+  <span class="muted" id="gameid"></span>
+</header>
+<main>
+  <div class="card" id="setup">
+    <h3 style="margin-top:0">Nuova partita</h3>
+    <div id="seats"></div>
+    <div class="row"><label class="muted">Seed (opzionale) <input id="seed" type="number" style="width:120px"></label></div>
+    <button class="primary" id="start">Inizia</button>
+    <p class="muted" style="max-width:420px">Si gioca a turno sullo stesso schermo. Quando tocca a te premi
+      <b>"Mostra la mia carta"</b> per vedere il tuo obiettivo (gli altri girano lo sguardo 🙂).
+      Ogni partita viene salvata nella cartella <code>games/</code>.</p>
+  </div>
+  <div class="card hidden" id="boardcard"><canvas id="board" width="640" height="640"></canvas></div>
+  <div id="side" class="hidden">
+    <div class="card">
+      <div id="turn"></div>
+      <div id="hint" class="muted"></div>
+      <div id="banner"></div>
+    </div>
+    <div class="card" id="controls">
+      <div style="display:flex; gap:14px; align-items:center">
+        <canvas id="spare" width="96" height="96"></canvas>
+        <div>
+          <div class="muted">Tessera libera</div>
+          <button id="rotl">⟲</button> <button id="rotr">⟳ ruota (R)</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <button id="reveal" class="primary" style="width:100%">👁 Mostra la mia carta</button>
+      <div id="secret" class="hidden"></div>
+    </div>
+    <div class="card" id="players"></div>
+    <div class="card"><div class="muted">Ultime mosse</div><div id="log"></div></div>
+  </div>
+</main>
+<script>
+const COLORS = ["#e6b414", "#dc322f", "#266ed2", "#28a046"];
+const CNAMES = ["Giallo", "Rosso", "Blu", "Verde"];
+const EMOJI = ["📖","💰","🗺️","👑","🗝️","💀","💍","🧰","💎","🗡️","🕯️","⛑️","🧞","🦇","🐉","👻","🧙‍♀️","🧔","🦉","🐀","🦋","🕷️","🦎","🪲"];
+const IT = ["libro","borsa di monete","mappa","corona","chiavi","teschio","anello","forziere","smeraldo","spada","candelabro","elmo",
+            "genio","pipistrello","drago","fantasma","maga","nano","gufo","topo","falena","ragno","lucertola","scarabeo"];
+const $ = id => document.getElementById(id);
+let G = null, rot = 0, revealed = false, revealSeat = -1, hover = null, lastTurnKey = "";
+const M = 48, S = (640 - 2 * M) / 7;
+
+// ---------------------------------------------------------------- setup
+const DEFAULT = [["Tu", "human"], ["IA 1", "agent"], ["IA 2", "agent"], ["IA 3", "agent"]];
+$("seats").innerHTML = DEFAULT.map(([n, k], i) => `
+  <div class="row"><span class="dot" style="background:${COLORS[i]}"></span>
+  <input id="name${i}" value="${n}" style="width:130px">
+  <select id="kind${i}"><option value="human">Umano</option><option value="agent">IA (agente)</option>
+  <option value="greedy">Greedy</option><option value="random">Random</option><option value="none">— vuoto —</option></select></div>`).join("");
+DEFAULT.forEach(([n, k], i) => $("kind" + i).value = k);
+$("start").onclick = async () => {
+  const seats = [0, 1, 2, 3].map(i => ({ name: $("name" + i).value, kind: $("kind" + i).value })).filter(s => s.kind !== "none");
+  const body = { seats }; if ($("seed").value) body.seed = +$("seed").value;
+  const r = await fetch("/api/new", { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) { alert((await r.json()).error); return; }
+  showGame(true); rot = 0; revealed = false;
+};
+$("newbtn").onclick = () => showGame(false);
+function showGame(on) {
+  $("setup").classList.toggle("hidden", on);
+  $("boardcard").classList.toggle("hidden", !on); $("side").classList.toggle("hidden", !on);
+}
+
+// ---------------------------------------------------------------- tiles
+const rotMask = (m, k) => { for (let i = 0; i < ((k % 4) + 4) % 4; i++) m = ((m << 1) | (m >> 3)) & 15; return m; };
+function drawTile(ctx, x, y, s, mask, t, collected) {
+  ctx.fillStyle = "#5a4634"; ctx.fillRect(x, y, s, s);
+  const w = s / 3; ctx.fillStyle = "#ece0c4";
+  ctx.fillRect(x + w, y + w, w, w);
+  if (mask & 1) ctx.fillRect(x + w, y, w, w + 1);
+  if (mask & 2) ctx.fillRect(x + 2 * w - 1, y + w, w + 1, w);
+  if (mask & 4) ctx.fillRect(x + w, y + 2 * w - 1, w, w + 1);
+  if (mask & 8) ctx.fillRect(x, y + w, w + 1, w);
+  ctx.strokeStyle = "#00000066"; ctx.strokeRect(x + .5, y + .5, s - 1, s - 1);
+  if (t >= 0) {
+    ctx.globalAlpha = collected ? 0.3 : 1;
+    ctx.font = `${Math.round(w * 0.9)}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(EMOJI[t], x + s / 2, y + s / 2 + 1); ctx.globalAlpha = 1;
+    ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+  }
+}
+function slotPos(k) {
+  const side = Math.floor(k / 3), line = [1, 3, 5][k % 3], mid = M + line * S + S / 2;
+  return [[mid, M / 2], [640 - M / 2, mid], [mid, 640 - M / 2], [M / 2, mid]][side];
+}
+
+// ---------------------------------------------------------------- render
+function myTurn() { return G && G.winner < 0 && G.seats[G.current].kind === "human"; }
+function draw() {
+  if (!G) return;
+  const ctx = $("board").getContext("2d");
+  ctx.fillStyle = "#16151b"; ctx.fillRect(0, 0, 640, 640);
+  const col = new Set(G.collected || []);
+  const target = revealed && G.my_target ? G.my_target.id : null;
+  for (let r = 0; r < 7; r++) for (let c = 0; c < 7; c++) {
+    const t = G.treasure[r][c];
+    drawTile(ctx, M + c * S, M + r * S, S, G.board[r][c], t, col.has(t));
+    if (target !== null && target >= 0 && t === target) {
+      ctx.lineWidth = 5; ctx.strokeStyle = COLORS[G.current]; ctx.strokeRect(M + c * S + 3, M + r * S + 3, S - 6, S - 6); ctx.lineWidth = 1; }
+  }
+  G.home.forEach(([r, c], p) => { ctx.setLineDash([5, 4]); ctx.lineWidth = 2; ctx.strokeStyle = COLORS[p];
+    ctx.strokeRect(M + c * S + 7, M + r * S + 7, S - 14, S - 14); ctx.setLineDash([]); ctx.lineWidth = 1; });
+  if (target === -1) { const [r, c] = G.home[G.current]; ctx.lineWidth = 5; ctx.strokeStyle = COLORS[G.current];
+    ctx.strokeRect(M + c * S + 3, M + r * S + 3, S - 6, S - 6); ctx.lineWidth = 1; }
+  // reachable cells (move phase)
+  if (G.reachable && myTurn()) {
+    ctx.fillStyle = "rgba(255,209,102,0.28)";
+    for (let r = 0; r < 7; r++) for (let c = 0; c < 7; c++) if (G.reachable[r][c]) ctx.fillRect(M + c * S + 2, M + r * S + 2, S - 4, S - 4);
+  }
+  // slots
+  const forb = G.last_slot >= 0 ? (G.last_slot + 6) % 12 : -1;
+  for (let k = 0; k < 12; k++) {
+    const [x, y] = slotPos(k), side = Math.floor(k / 3);
+    const can = G.phase === 0 && myTurn() && k !== forb;
+    ctx.save(); ctx.translate(x, y); ctx.rotate([0, Math.PI / 2, Math.PI, -Math.PI / 2][side]);
+    ctx.beginPath(); ctx.moveTo(0, 12); ctx.lineTo(-11, -8); ctx.lineTo(11, -8); ctx.closePath();
+    ctx.fillStyle = k === forb ? "#3a3a3a" : (hover === "s" + k && can) ? "#ffd166" : k === G.last_slot ? "#b08a3a" : can ? "#ddd" : "#777";
+    ctx.fill(); ctx.restore();
+  }
+  // ghost of the spare tile next to the hovered slot
+  if (hover && hover[0] === "s" && G.phase === 0 && myTurn()) {
+    const k = +hover.slice(1), side = Math.floor(k / 3), line = [1, 3, 5][k % 3];
+    const [gx, gy] = [[M + line * S, M - S + 6], [640 - M - 6, M + line * S], [M + line * S, 640 - M - 6], [M - S + 6, M + line * S]][side];
+    ctx.globalAlpha = 0.55; drawTile(ctx, gx, gy, S, rotMask(G.spare, rot), G.spare_treasure, false); ctx.globalAlpha = 1;
+  }
+  // pawns
+  const offs = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+  G.pos.forEach(([r, c], p) => {
+    const x = M + c * S + S / 2 + offs[p][0] * S / 5.5, y = M + r * S + S / 2 + offs[p][1] * S / 5.5;
+    ctx.beginPath(); ctx.arc(x, y, S / 7, 0, 7); ctx.fillStyle = COLORS[p]; ctx.fill();
+    ctx.lineWidth = p === G.current ? 3 : 1.5; ctx.strokeStyle = p === G.current ? "#fff" : "#000"; ctx.stroke(); ctx.lineWidth = 1;
+  });
+  // spare
+  const sc = $("spare").getContext("2d"); sc.clearRect(0, 0, 96, 96);
+  drawTile(sc, 0, 0, 96, rotMask(G.spare, myTurn() && G.phase === 0 ? rot : 0), G.spare_treasure, col.has(G.spare_treasure));
+}
+
+function panel() {
+  const cur = G.seats[G.current];
+  $("turn").innerHTML = G.winner >= 0 ? "" :
+    `<span class="dot" style="background:${COLORS[G.current]}"></span>Tocca a <b>${cur.name}</b>`;
+  $("hint").textContent = G.winner >= 0 ? "" : cur.kind !== "human" ? (G.thinking ? "🤔 sta pensando…" : "")
+    : G.phase === 0 ? "1) Ruota la tessera e clicca una freccia per inserirla" : "2) Clicca una casella evidenziata per muoverti (anche la tua per restare fermo)";
+  $("banner").textContent = G.winner >= 0 ? `🏆 Vince ${G.seats[G.winner].name}!` : "";
+  $("controls").classList.toggle("hidden", !(myTurn() && G.phase === 0));
+  const humanTurn = myTurn();
+  $("reveal").classList.toggle("hidden", !humanTurn || revealed);
+  $("secret").classList.toggle("hidden", !(humanTurn && revealed));
+  if (humanTurn && revealed && G.my_target) {
+    const t = G.my_target.id;
+    $("secret").innerHTML = t === -1 ? "🏠 Torna alla tua casella di partenza!" : `${EMOJI[t]}<br><b>${IT[t]}</b>`;
+  }
+  $("players").innerHTML = G.seats.map((s, p) => `
+    <div class="player ${p === G.current && G.winner < 0 ? "active" : ""}">
+      <span class="dot" style="background:${COLORS[p]}"></span><b>${s.name}</b>
+      <span class="muted">(${s.kind === "human" ? "umano" : s.kind === "agent" ? "IA" : s.kind})</span>
+      — ${G.found[p]}/${G.deck_sizes[p]} ${G.going_home[p] ? "🏠" : ""}
+      <div class="treasures">${G.collected_by[p].map(t => EMOJI[t]).join(" ")}</div>
+    </div>`).join("");
+  $("log").innerHTML = (G.log || []).slice().reverse().map(e => `${e.who}: ${e.phase === "shift" ? "inserisce" : "si muove"} (${e.think_s}s)`).join("<br>");
+  $("gameid").textContent = G.game_id ? `partita ${G.game_id}` : "";
+}
+
+// ---------------------------------------------------------------- input
+function cellAt(ev) {
+  const b = $("board").getBoundingClientRect(), k = 640 / b.width;
+  const x = (ev.clientX - b.left) * k, y = (ev.clientY - b.top) * k;
+  for (let s = 0; s < 12; s++) { const [sx, sy] = slotPos(s); if (Math.hypot(sx - x, sy - y) < 20) return "s" + s; }
+  const c = Math.floor((x - M) / S), r = Math.floor((y - M) / S);
+  return r >= 0 && r < 7 && c >= 0 && c < 7 ? "c" + (r * 7 + c) : null;
+}
+$("board").onmousemove = ev => { const h = cellAt(ev); if (h !== hover) { hover = h; draw(); } };
+$("board").onclick = async ev => {
+  if (!myTurn()) return;
+  const h = cellAt(ev); if (!h) return;
+  let action = null;
+  if (G.phase === 0 && h[0] === "s") action = (+h.slice(1)) * 4 + rot;
+  if (G.phase === 1 && h[0] === "c") { const i = +h.slice(1); if (G.reachable[Math.floor(i / 7)][i % 7]) action = 48 + i; }
+  if (action === null) return;
+  const r = await fetch("/api/action", { method: "POST", body: JSON.stringify({ seat: G.current, action }) });
+  if (!r.ok) { const e = await r.json(); $("hint").textContent = "⚠ " + e.error; return; }
+  if (G.phase === 1) revealed = false;  // hide the card when the turn ends
+  rot = 0; poll();
+};
+$("rotr").onclick = () => { rot = (rot + 1) % 4; draw(); };
+$("rotl").onclick = () => { rot = (rot + 3) % 4; draw(); };
+document.onkeydown = e => { if (e.key === "r" || e.key === "R") { rot = (rot + 1) % 4; draw(); } };
+$("reveal").onclick = () => { revealed = true; revealSeat = G.current; poll(); };
+
+async function poll() {
+  try {
+    const q = revealed ? `?reveal=${revealSeat}` : "";
+    const js = await (await fetch("/api/state" + q)).json();
+    $("agentinfo").textContent = `IA = ${js.agent}`;
+    if (js.game) {
+      G = js.game;
+      const key = `${G.turn}-${G.current}`;
+      if (revealed && G.current !== revealSeat) revealed = false;
+      if (key !== lastTurnKey) { lastTurnKey = key; }
+      if ($("setup").classList.contains("hidden")) { draw(); panel(); }
+    }
+  } catch (e) {}
+}
+setInterval(poll, 350); poll();
+fetch("/api/state").then(r => r.json()).then(js => { if (js.game && js.game.winner < 0) showGame(true); });
+</script>
+</body>
+</html>
