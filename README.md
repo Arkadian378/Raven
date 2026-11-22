@@ -97,7 +97,8 @@ python -m labyrinth.play.server --agent mcts:runs/az/best.pt:200
 # apri http://127.0.0.1:8000  (--host 0.0.0.0 per giocare da altri dispositivi in rete locale)
 ```
 
-Si sceglie per ogni posto: umano, IA, greedy o random. Gli umani giocano a turno sullo stesso schermo e vedono la propria carta solo premendo "Mostra la mia carta". Ogni partita è salvata dopo ogni mossa in `games/<id>.json` (seed, sequenza di azioni, tempi di riflessione, vincitore) e si può rivedere con `python examples/replay_game.py games/<id>.json`.
+Si sceglie per ogni posto: umano, IA, greedy o random. Gli umani giocano a turno sullo stesso schermo e vedono la propria carta solo premendo "Mostra la mia carta". Ogni partita è salvata dopo ogni mossa in `games/<id>.json` (seed, sequenza di azioni, tempi di riflessione, vincitore) e si può rivedere con `python examples/replay_game.py games/<id>.json`. 
+Modelli https://huggingface.co/Gab378/Raven.
 
 ## Paper
 
