@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import signal
 import time
 from pathlib import Path
 
@@ -22,8 +23,12 @@ from labyrinth.agents import GreedyAgent
 from labyrinth.core import NUM_ACTIONS
 from labyrinth.env import LabyrinthEnv
 from labyrinth.observation import ObservationConfig
-from train.data import SampleBuffer, ego, outcome_vector, train_steps
-from train.model import LabyrinthNet
+from train.data import SampleBuffer, ego, opponent_targets, outcome_vector, train_steps
+from train.model import build_net
+
+
+def _ignore_sigint():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C is handled by the main process
 
 
 def play_expert_game(job):
@@ -41,16 +46,16 @@ def play_expert_game(job):
         pi[best] = 1.0 / len(best)
         if rng.random() < eps[p]:  # exploratory move: keep state, no policy label
             a = int(rng.choice(np.flatnonzero(obs["action_mask"])))
-            records.append((obs, None, p))
+            records.append((obs, None, p, None))
         else:
             a = int(rng.choice(best))
-            records.append((obs, pi, p))
+            records.append((obs, pi, p, opponent_targets(env.state, p)))
         obs, r, term, trunc, _ = env.step(a)
         if term or trunc:
             break
     z = outcome_vector(env.state)
     n = env.num_players
-    return [(o, pi, ego(z, p, n)) for o, pi, p in records if pi is not None], env.state.turn
+    return [(o, pi, ego(z, p, n), opp) for o, pi, p, opp in records if pi is not None], env.state.turn
 
 
 def evaluate_policy(net, cfg, games=24, opponent="greedy", seed=50_000):
@@ -89,6 +94,7 @@ def main(argv=None):
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6)
     ap.add_argument("--observability", default="partial", choices=["partial", "full"])
+    ap.add_argument("--history", type=int, default=2, help="opponents' last moves given to the network")
     ap.add_argument("--noise", type=float, nargs="+", default=[0.0, 0.0, 0.05, 0.15],
                     help="per-seat probability of a random move, sampled per game")
     ap.add_argument("--data", default=None, help="reuse a saved dataset (.npz)")
@@ -99,17 +105,21 @@ def main(argv=None):
     args = ap.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    cfg = {"observability": args.observability}
+    cfg = {"observability": args.observability, "history": args.history}
     probe = LabyrinthEnv(obs_config=ObservationConfig(**cfg))
     t0 = time.time()
 
     if args.data:
         buf = SampleBuffer.load(args.data)
+        if buf.planes_shape != tuple(probe.planes_shape):
+            raise SystemExit(f"{args.data} was generated with other observation settings "
+                             f"(planes {buf.planes_shape}, now {tuple(probe.planes_shape)}): "
+                             "regenerate it or pass the matching --history")
     else:
         jobs = [(args.seed * 1_000_000 + g, cfg, args.noise) for g in range(args.games)]
         buf = SampleBuffer(args.games * 80, probe.planes_shape, probe.vector_shape[0])
         lengths = []
-        with mp.Pool(args.workers) as pool:
+        with mp.Pool(args.workers, initializer=_ignore_sigint) as pool:
             for k, (samples, turns) in enumerate(pool.imap_unordered(play_expert_game, jobs, chunksize=8)):
                 buf.extend(samples)
                 lengths.append(turns)
@@ -119,7 +129,7 @@ def main(argv=None):
         print(f"dataset: {buf.size} samples, mean game length {np.mean(lengths):.1f} turns")
 
     device = torch.device(args.device)
-    net = LabyrinthNet(probe.planes_shape[0], probe.vector_shape[0], args.channels, args.blocks).to(device)
+    net = build_net({**vars(args), "view_radius": None}).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     steps_per_epoch = max(1, buf.size // args.batch)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps_per_epoch * args.epochs)
@@ -129,12 +139,14 @@ def main(argv=None):
         def step(self): opt.step(); sched.step()
 
     rng = np.random.default_rng(args.seed)
-    ck_args = {**vars(args), "observability": args.observability, "view_radius": None}
+    ck_args = {**vars(args), "observability": args.observability, "view_radius": None, "history": args.history,
+               "belief_trained": bool((buf.opp[:buf.size] >= 0).any())}
     for ep in range(1, args.epochs + 1):
-        pl, vl, acc = train_steps(net, _Opt(), buf, steps_per_epoch, args.batch, device, rng=rng)
+        m = train_steps(net, _Opt(), buf, steps_per_epoch, args.batch, device, rng=rng)
         wr, cf = evaluate_policy(net.cpu(), cfg, args.eval_games)
         net.to(device)
-        row = {"epoch": ep, "policy_loss": pl, "value_loss": vl, "top1_in_expert_set": acc,
+        row = {"epoch": ep, "policy_loss": m["policy_loss"], "value_loss": m["value_loss"],
+               "top1_in_expert_set": m["top1"], "belief_loss": m["belief_loss"], "belief_top1": m["belief_top1"],
                "win_rate_vs_greedy": wr, "cards_frac_vs_greedy": cf, "time": time.time() - t0}
         print(json.dumps(row), flush=True)
         with open(out / "metrics.jsonl", "a") as f:

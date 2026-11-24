@@ -14,6 +14,10 @@
   forward pass (the move-phase observation contains the exact reachable set,
   so the value of "after this insertion" is easy to judge). Every insertion
   thus starts with a value estimate instead of a blind first-play urgency.
+* **Opponent model.** If the network has a trained belief head, each
+  determinisation samples the opponents' current targets from the network's
+  belief (mixed with a little uniform noise) instead of uniformly, so the
+  search plans against what the opponents are most likely trying to reach.
 * **PUCT** selection with the network policy as prior, Dirichlet noise at the
   root for self-play exploration, and visit-count based action selection.
 """
@@ -48,13 +52,15 @@ class MCTS:
     def __init__(self, net, obs_config: ObservationConfig = ObservationConfig(), sims: int = 200,
                  c_puct: float = 1.5, dirichlet_alpha: float = 0.3, noise_frac: float = 0.25,
                  max_turns: int = 400, device="cpu", seed: int | None = None, determinize: bool = True,
-                 expand_shifts: bool = True):
+                 expand_shifts: bool = True, belief: bool = True, belief_eps: float = 0.1):
         self.net, self.cfg, self.sims = net, obs_config, sims
         self.c_puct, self.alpha, self.noise_frac = c_puct, dirichlet_alpha, noise_frac
         self.max_turns, self.device = max_turns, device
         self.rng = np.random.default_rng(seed)
         self.determinize = determinize and obs_config.observability != "full"
         self.expand_shifts = expand_shifts
+        self.belief = belief and getattr(net, "belief_trained", False)
+        self.belief_eps = belief_eps
 
     # ------------------------------------------------------------ network
     def evaluate(self, s: GameState):
@@ -78,6 +84,18 @@ class MCTS:
             out.append((o["action_mask"], p, v))
         return out
 
+    @torch.no_grad()
+    def opponent_beliefs(self, s: GameState, player: int) -> dict[int, np.ndarray]:
+        """Network belief over each opponent's current target, absolute seats."""
+        o = encode(s, player, self.cfg, self.max_turns)
+        t = lambda k, dt: torch.as_tensor(o[k][None], dtype=dt, device=self.device)
+        _, _, b = self.net.forward_full(t("planes", torch.float32), t("vector", torch.float32),
+                                        t("action_mask", torch.bool))
+        b = torch.softmax(b[0], -1).cpu().numpy().astype(np.float64)
+        b = (1 - self.belief_eps) * b + self.belief_eps / b.shape[1]
+        n = s.num_players
+        return {(player + i) % n: b[i - 1] for i in range(1, n)}
+
     def _expand(self, node: Node, s: GameState, mask, prior, noise: bool = False):
         node.player = s.current
         legal = np.flatnonzero(mask)
@@ -95,8 +113,10 @@ class MCTS:
         root = Node()
         base = state.clone()
         base.history = []
+        beliefs = self.opponent_beliefs(base, observer) if self.determinize and self.belief else None
+        self.last_beliefs = beliefs
         for sim in range(self.sims):
-            s = base.determinize(observer, self.rng) if self.determinize else base.clone()
+            s = base.determinize(observer, self.rng, beliefs) if self.determinize else base.clone()
             node, path = root, [root]
             while node.children is not None and not s.done and s.turn < self.max_turns:
                 a, node = self._select(node)
@@ -179,12 +199,16 @@ class MCTSAgent:
 class NetAgent:
     """Raw policy network (no search): argmax or sampling."""
 
-    def __init__(self, net, sample: bool = False, seed=None):
+    def __init__(self, net, sample: bool = False, seed=None, obs_config: ObservationConfig | None = None,
+                 max_turns: int = 400):
         self.net, self.sample, self.name = net, sample, "net"
         self.rng = np.random.default_rng(seed)
+        self.cfg, self.max_turns = obs_config, max_turns
 
     @torch.no_grad()
     def act(self, obs, state=None, player=None) -> int:
+        if self.cfg is not None and state is not None:  # encode with the network's own observation settings
+            obs = encode(state, state.current if player is None else player, self.cfg, self.max_turns)
         t = lambda k, dt: torch.as_tensor(obs[k][None], dtype=dt)
         logits, _ = self.net(t("planes", torch.float32), t("vector", torch.float32), t("action_mask", torch.bool))
         if self.sample:

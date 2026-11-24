@@ -1,7 +1,10 @@
 """Head-to-head evaluation: one agent (rotating seat) vs. three opponents.
 
 Agent specs:
-    greedy | random | net:PATH | mcts:PATH[:SIMS]
+    greedy | random | net:PATH | mcts:PATH[:SIMS[:nobelief]]
+
+    ``nobelief`` makes the search sample opponents' targets uniformly even if
+    the network has a trained opponent model (ablation).
 
     python -m train.evaluate --agent mcts:runs/bc/final.pt:200 --opponent greedy --games 100
 """
@@ -10,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import signal
 import time
 
 import numpy as np
@@ -22,6 +26,10 @@ from labyrinth.observation import ObservationConfig
 _NETS = {}
 
 
+def _ignore_sigint():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C is handled by the main process
+
+
 def make_agent(spec: str, seed: int):
     kind, *rest = spec.split(":")
     if kind == "greedy":
@@ -29,27 +37,27 @@ def make_agent(spec: str, seed: int):
     if kind == "random":
         return RandomAgent(seed)
     from train.mcts import MCTSAgent, NetAgent
-    from train.model import load_checkpoint
+    from train.model import load_checkpoint, obs_config_from_args
     path = rest[0]
     if path not in _NETS:
         _NETS[path] = load_checkpoint(path)
     net, args = _NETS[path]
+    cfg = obs_config_from_args(args)
     if kind == "net":
-        return NetAgent(net, seed=seed)
+        return NetAgent(net, seed=seed, obs_config=cfg)
     if kind == "mcts":
         sims = int(rest[1]) if len(rest) > 1 else 200
-        cfg = ObservationConfig(observability=args.get("observability", "partial"))
-        return MCTSAgent(net, sims=sims, obs_config=cfg, seed=seed)
+        return MCTSAgent(net, sims=sims, obs_config=cfg, seed=seed, belief="nobelief" not in rest[2:])
     raise ValueError(f"unknown agent spec {spec!r}")
 
 
 def obs_config_for(spec: str) -> ObservationConfig:
     kind, *rest = spec.split(":")
     if kind in ("net", "mcts"):
-        from train.model import load_checkpoint
+        from train.model import load_checkpoint, obs_config_from_args
         if rest[0] not in _NETS:
             _NETS[rest[0]] = load_checkpoint(rest[0])
-        return ObservationConfig(observability=_NETS[rest[0]][1].get("observability", "partial"))
+        return obs_config_from_args(_NETS[rest[0]][1])
     return ObservationConfig()
 
 
@@ -77,7 +85,7 @@ def play(job):
 
 def run(agent, opponent, games=48, workers=None, seed=123_000, max_turns=400):
     jobs = [(g, agent, opponent, seed, max_turns) for g in range(games)]
-    with mp.get_context("spawn").Pool(workers or mp.cpu_count()) as pool:
+    with mp.get_context("spawn").Pool(workers or mp.cpu_count(), initializer=_ignore_sigint) as pool:
         res = pool.map(play, jobs)
     w = np.array([r["win"] for r in res], float)
     ci = 1.96 * np.sqrt(w.mean() * (1 - w.mean()) / len(w))

@@ -62,6 +62,9 @@ def decode_move(action: int) -> tuple[int, int]:
     return divmod(action - NUM_SHIFT_ACTIONS, BOARD_SIZE)
 
 
+TRAIL_LEN = 3  # moves remembered per pawn (see GameState.trail)
+
+
 @dataclass
 class GameState:
     """Complete (god-view) state of a game. Mutable; use :meth:`clone`."""
@@ -79,6 +82,15 @@ class GameState:
     turn: int = 0                # number of completed player turns
     winner: int = -1
     history: list = field(default_factory=list)
+    # trail[k, p] = where pawn p stood when it started its (k+1)-th most recent
+    # move (after that turn's insertion), carried along by later insertions;
+    # (-1,-1) if unknown or if p has collected a card since. Public information:
+    # it lets a policy infer what an opponent is heading for.
+    trail: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.trail is None:
+            self.trail = np.full((TRAIL_LEN, len(self.decks), 2), -1, dtype=np.int16)
 
     # ------------------------------------------------------------------ setup
     @classmethod
@@ -151,6 +163,7 @@ class GameState:
             turn=self.turn,
             winner=self.winner,
             history=list(self.history),
+            trail=self.trail.copy(),
         )
 
     # -------------------------------------------------------------- queries
@@ -262,6 +275,14 @@ class GameState:
                 self.pos[p, 0] = (r + delta) % BOARD_SIZE
             elif axis == 0 and r == line:
                 self.pos[p, 1] = (c + delta) % BOARD_SIZE
+        tr = self.trail.reshape(-1, 2)
+        known = tr[:, 0] >= 0
+        if axis == 1:
+            hit = known & (tr[:, 1] == line)
+            tr[hit, 0] = (tr[hit, 0] + delta) % BOARD_SIZE
+        else:
+            hit = known & (tr[:, 0] == line)
+            tr[hit, 1] = (tr[hit, 1] + delta) % BOARD_SIZE
 
     def apply_move(self, row: int, col: int) -> dict:
         """Move the current pawn; returns a dict of events for reward shaping."""
@@ -270,12 +291,15 @@ class GameState:
         p = self.current
         if not self.reachable(p)[row, col]:
             raise ValueError(f"cell {(row, col)} not reachable")
+        self.trail[1:, p] = self.trail[:-1, p]
+        self.trail[0, p] = self.pos[p]
         self.pos[p] = (row, col)
         events = {"player": p, "collected": None, "won": False}
         t = self.target(p)
         if t != HOME and int(self.treasure[row, col]) == t:
             self.found[p] += 1
             events["collected"] = t
+            self.trail[:, p] = -1  # the trail pointed at the old target
         elif t == HOME and (row, col) == self.home(p):
             self.winner = p
             events["won"] = True
@@ -294,31 +318,46 @@ class GameState:
         return self.apply_move(*decode_move(action))
 
     # -------------------------------------------------------- partial info
-    def determinize(self, player: int, rng: np.random.Generator) -> "GameState":
+    def determinize(self, player: int, rng: np.random.Generator,
+                    target_probs: dict[int, np.ndarray] | None = None) -> "GameState":
         """Sample a full state consistent with ``player``'s information set.
 
         Hidden information in Labyrinth is the content of the treasure decks:
         a player only sees the top card of its own deck and the cards already
         collected by everybody. All other cards (opponents' current targets,
-        future cards of every deck, including its own) are reshuffled uniformly
-        among the unseen treasures. Used for determinized / information-set
-        MCTS (e.g. PIMC, IS-MCTS) on top of the POMDP.
+        future cards of every deck, including its own) are reshuffled among
+        the unseen treasures. Used for determinized / information-set MCTS.
+
+        ``target_probs`` optionally maps an opponent seat to a distribution
+        over the 24 treasures (an opponent model, e.g. the network's belief
+        head): that opponent's *current* target is sampled from it, restricted
+        to the unseen treasures, instead of uniformly.
         """
         s = self.clone()
         known = set(s.collected_treasures())
         own_t = s.target(player)
         if own_t != HOME:
             known.add(own_t)
-        pool = [t for t in range(NUM_TREASURES) if t not in known]
-        # also treasures never dealt are unseen; keep deck sizes unchanged
+        unseen = [t for t in range(NUM_TREASURES) if t not in known]
+        current = {}
+        for p, probs in (target_probs or {}).items():
+            if p == player or s.found[p] >= len(s.decks[p]):
+                continue
+            w = np.asarray(probs, np.float64)[unseen]
+            w = np.where(np.isin(unseen, list(current.values())), 0.0, np.maximum(w, 0.0))
+            if w.sum() <= 0:
+                continue
+            current[p] = int(unseen[int(rng.choice(len(unseen), p=w / w.sum()))])
+        pool = [t for t in unseen if t not in current.values()]
         pool = list(rng.permutation(pool))
         for p in range(s.num_players):
             k = int(s.found[p])
-            keep = k + 1 if p == player else k
-            need = len(s.decks[p]) - keep
-            if need > 0:
-                s.decks[p] = s.decks[p][:keep] + [int(x) for x in pool[:need]]
-                pool = pool[need:]
+            head = s.decks[p][:k + 1] if p == player else s.decks[p][:k]
+            if p in current:
+                head = head + [current[p]]
+            need = len(s.decks[p]) - len(head)
+            s.decks[p] = head + [int(x) for x in pool[:need]]
+            pool = pool[need:]
         return s
 
     # ----------------------------------------------------------- export

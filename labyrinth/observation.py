@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .core import NUM_ACTIONS, PHASE_SHIFT, GameState
+from .core import NUM_ACTIONS, PHASE_SHIFT, TRAIL_LEN, GameState
 from .tiles import BOARD_SIZE, HOME, NUM_SLOTS, NUM_TREASURES, SIDES, opposite_slot
 
 MAX_PLAYERS = 4
@@ -40,10 +40,13 @@ class ObservationConfig:
     view_radius: int | None = None      # None = whole board visible
     treasure_id_planes: bool = True     # one plane per treasure identity
     reachability_plane: bool = True     # derived feature: reachable cells
+    history: int = 0                    # opponents' last moves shown as trail planes (0..TRAIL_LEN)
 
     def __post_init__(self):
         if self.observability not in ("partial", "full"):
             raise ValueError("observability must be 'partial' or 'full'")
+        if not 0 <= self.history <= TRAIL_LEN:
+            raise ValueError(f"history must be in [0, {TRAIL_LEN}]")
 
 
 def plane_names(cfg: ObservationConfig) -> list[str]:
@@ -57,6 +60,8 @@ def plane_names(cfg: ObservationConfig) -> list[str]:
     names += [f"opp_target_rel{i}" for i in range(1, MAX_PLAYERS)]  # privileged
     if cfg.treasure_id_planes:
         names += [f"treasure_{t}" for t in range(NUM_TREASURES)]
+    # appended last so that checkpoints without history can be widened with zero weights
+    names += [f"trail{k}_rel{i}" for k in range(cfg.history) for i in range(1, MAX_PLAYERS)]
     return names
 
 
@@ -132,6 +137,13 @@ def encode(state: GameState, player: int, cfg: ObservationConfig, max_turns: int
         vec[vn[f"remaining_frac_rel{i}"]] = state.remaining(p) / n_cards
         vec[vn[f"going_home_rel{i}"]] = float(state.remaining(p) == 0)
         vec[vn[f"active_rel{i}"]] = 1.0
+
+    # ---- opponents' recent moves (public, but only remembered by the state)
+    for k in range(cfg.history):
+        for i, p in enumerate(rel[1:], start=1):
+            r, c = state.trail[k, p]
+            if r >= 0:
+                planes[pn[f"trail{k}_rel{i}"], r, c] = 1.0
 
     # ---- privileged information (only in the fully observable regime)
     if cfg.observability == "full":
