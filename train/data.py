@@ -14,7 +14,11 @@ class SampleBuffer:
     """Ring buffer of (planes, vector, mask, pi, z, opp) samples.
 
     ``opp`` holds, for each opponent in ego order, the treasure it was looking
-    for at that moment (-1 = none / unknown); it trains the belief head."""
+    for at that moment (-1 = none / unknown); it trains the belief head.
+    ``score`` is the final fraction of cards found by every seat (ego order,
+    -1 = unknown); it trains the auxiliary score head.
+    A sample whose ``pi`` is all zeros only trains the value-type heads
+    (positions played with a fast search, see playout cap randomisation)."""
 
     def __init__(self, capacity: int, planes_shape, vec_dim: int, num_actions: int = 97):
         self.capacity, self.planes_shape = capacity, tuple(planes_shape)
@@ -25,17 +29,19 @@ class SampleBuffer:
         self.pi = np.zeros((capacity, num_actions), np.float16)
         self.z = np.zeros((capacity, MAX_PLAYERS), np.float32)
         self.opp = np.full((capacity, MAX_PLAYERS - 1), -1, np.int8)
+        self.score = np.full((capacity, MAX_PLAYERS), -1, np.float16)
         self.num_actions = num_actions
         self.size = self.ptr = 0
 
-    def add(self, obs: dict, pi: np.ndarray, z: np.ndarray, opp=None) -> None:
+    def add(self, obs: dict, pi, z: np.ndarray, opp=None, score=None) -> None:
         i = self.ptr
         self.planes[i] = np.packbits(obs["planes"].astype(bool).ravel())
         self.vector[i] = obs["vector"]
         self.mask[i] = np.packbits(obs["action_mask"].astype(bool))
-        self.pi[i] = pi
+        self.pi[i] = 0 if pi is None else pi
         self.z[i] = z
         self.opp[i] = -1 if opp is None else opp
+        self.score[i] = -1 if score is None else score
         self.ptr = (i + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
@@ -49,12 +55,13 @@ class SampleBuffer:
         mask = np.unpackbits(self.mask[idx], axis=1)[:, :self.num_actions].astype(bool)
         t = lambda x, dt: torch.as_tensor(x, device=device, dtype=dt)
         return (t(planes, torch.float32), t(self.vector[idx], torch.float32), t(mask, torch.bool),
-                t(self.pi[idx], torch.float32), t(self.z[idx], torch.float32), t(self.opp[idx], torch.long))
+                t(self.pi[idx], torch.float32), t(self.z[idx], torch.float32), t(self.opp[idx], torch.long),
+                t(self.score[idx], torch.float32))
 
     def save(self, path) -> None:
         n = self.size
         np.savez_compressed(path, planes=self.planes[:n], vector=self.vector[:n], mask=self.mask[:n],
-                            pi=self.pi[:n], z=self.z[:n], opp=self.opp[:n], planes_shape=np.array(self.planes_shape))
+                            pi=self.pi[:n], z=self.z[:n], opp=self.opp[:n], score=self.score[:n], planes_shape=np.array(self.planes_shape))
 
     @classmethod
     def load(cls, path) -> "SampleBuffer":
@@ -64,6 +71,8 @@ class SampleBuffer:
         buf.planes[:], buf.vector[:], buf.mask[:], buf.pi[:], buf.z[:] = d["planes"], d["vector"], d["mask"], d["pi"], d["z"]
         if "opp" in d:
             buf.opp[:] = d["opp"]
+        if "score" in d:
+            buf.score[:] = d["score"]
         buf.size, buf.ptr = n, 0
         return buf
 
@@ -94,46 +103,62 @@ def opponent_targets(state, player: int, max_players: int = MAX_PLAYERS) -> np.n
     return out
 
 
-def ego(z_abs: np.ndarray, player: int, n: int) -> np.ndarray:
+def score_vector(state, max_players: int = MAX_PLAYERS) -> np.ndarray:
+    """Final fraction of its cards found by every seat (absolute order), -1 for empty seats."""
+    out = np.full(max_players, -1, np.float32)
+    for p in range(state.num_players):
+        out[p] = state.found[p] / max(len(state.decks[p]), 1)
+    return out
+
+
+def ego(z_abs: np.ndarray, player: int, n: int, empty: float = 0.0) -> np.ndarray:
     """Absolute seat values -> ego-centric order (player first)."""
-    out = np.zeros_like(z_abs)
+    out = np.full_like(z_abs, empty)
     for i in range(n):
         out[i] = z_abs[(player + i) % n]
     return out
 
 
 def train_steps(net, opt, buf: SampleBuffer, steps: int, batch: int, device, value_coef: float = 1.0,
-                belief_coef: float = 0.5, rng=None) -> dict:
+                belief_coef: float = 0.5, score_coef: float = 1.0, rng=None) -> dict:
     """Policy cross-entropy (soft targets) + value MSE over all seats
-    + belief cross-entropy on the opponents' hidden targets."""
+    + belief cross-entropy on the opponents' hidden targets
+    + score MSE on the final fraction of cards of every seat."""
     import torch.nn.functional as F
     rng = rng or np.random.default_rng()
     net.train()
     logs = []
     for _ in range(steps):
         idx = rng.integers(0, buf.size, size=min(batch, buf.size))
-        planes, vec, mask, pi, z, opp = buf.batch(idx, device)
-        logits, values, belief = net.forward_full(planes, vec, mask)
+        planes, vec, mask, pi, z, opp, score = buf.batch(idx, device)
+        logits, values, belief, pred_score = net.forward_full(planes, vec, mask, with_score=True)
         logp = F.log_softmax(logits, dim=1)
-        ploss = -(pi * logp.clamp(min=-1e4)).sum(1).mean()
+        has_pi = pi.sum(1) > 0
+        if not has_pi.any():
+            has_pi[0] = True  # degenerate batch: keep the graph well defined
+        ploss = -(pi[has_pi] * logp[has_pi].clamp(min=-1e4)).sum(1).mean()
         vloss = F.mse_loss(values, z)
+        known = score >= 0
+        sloss = F.mse_loss(pred_score[known], score[known]) if known.any() else torch.zeros((), device=planes.device)
         has = opp >= 0
         if has.any():
             bl = F.cross_entropy(belief[has], opp[has])
             bacc = (belief[has].argmax(1) == opp[has]).float().mean().item()
         else:
             bl, bacc = torch.zeros((), device=planes.device), float("nan")
-        loss = ploss + value_coef * vloss + belief_coef * bl
+        loss = ploss + value_coef * vloss + belief_coef * bl + score_coef * sloss
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
+        pi, logits = pi[has_pi], logits[has_pi]
         top = pi.gather(1, logits.argmax(1, keepdim=True)).squeeze(1)
         acc = (top > 0).float().mean()                                  # net's choice is in the target's support
         exact = (top >= pi.max(1).values - 1e-6).float().mean()          # net's choice is the target's best action
         ent = -(pi * pi.clamp(min=1e-8).log()).sum(1).mean()
-        logs.append((ploss.item(), vloss.item(), acc.item(), bl.item(), bacc, exact.item(), (ploss - ent).item()))
+        logs.append((ploss.item(), vloss.item(), acc.item(), bl.item(), bacc, exact.item(), (ploss - ent).item(),
+                     sloss.item()))
     net.eval()
     m = np.nanmean(np.array(logs, float), axis=0)
     return {"policy_loss": m[0], "value_loss": m[1], "top1": m[2], "belief_loss": m[3], "belief_top1": m[4],
-            "top1_exact": m[5], "kl_target_net": m[6]}
+            "top1_exact": m[5], "kl_target_net": m[6], "score_loss": m[7]}

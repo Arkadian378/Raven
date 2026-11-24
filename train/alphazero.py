@@ -5,7 +5,10 @@ Each iteration:
      current network (plus, optionally, some greedy seats to keep the agent
      honest against a fixed style of play);
   2. each MCTS decision yields a sample (observation, visit distribution,
-     final outcome of every seat, the opponents' hidden targets);
+     final outcome and final card fraction of every seat, the opponents'
+     hidden targets). Playout cap randomisation (KataGo): only a fraction of
+     the decisions use the full search and give a policy target; the others
+     use a short search and train only the value, score and belief heads;
   3. the network is trained on a replay buffer of recent samples (policy,
      value, and the belief head that models the opponents' targets; once
      trained, the search uses it to sample determinisations);
@@ -29,7 +32,7 @@ import torch
 from labyrinth.agents import GreedyAgent
 from labyrinth.env import LabyrinthEnv
 from labyrinth.observation import ObservationConfig
-from train.data import SampleBuffer, ego, opponent_targets, outcome_vector, train_steps
+from train.data import SampleBuffer, ego, opponent_targets, outcome_vector, score_vector, train_steps
 from train.model import load_checkpoint, obs_config_from_args
 
 _W = {"version": None, "net": None, "args": None}
@@ -64,8 +67,10 @@ def selfplay_game(job):
         if kinds[p] == "mcts":
             ag = agents[p]
             ag.temperature = 1.0 if decisions < a["temp_decisions"] else 0.0
-            act = ag.act(obs, env.state, p, add_noise=True)
-            records.append((obs, ag.last_pi, p, opponent_targets(env.state, p)))
+            full = rng.random() < a["full_prob"]
+            ag.mcts.sims = a["sims"] if full else a["fast_sims"]
+            act = ag.act(obs, env.state, p, add_noise=full)
+            records.append((obs, ag.last_pi if full else None, p, opponent_targets(env.state, p)))
             decisions += 1
         else:
             act = agents[p].act(obs, env.state, p)
@@ -74,7 +79,8 @@ def selfplay_game(job):
         if term or trunc:
             break
     z = outcome_vector(env.state)
-    samples = [(o, pi, ego(z, p, n), opp) for o, pi, p, opp in records]
+    sc = score_vector(env.state)
+    samples = [(o, pi, ego(z, p, n), opp, ego(sc, p, n, empty=-1.0)) for o, pi, p, opp in records]
     s = env.state
     summary = {"seed": seed, "actions": actions, "kinds": kinds, "winner": int(s.winner),
                "winner_kind": kinds[s.winner] if s.winner >= 0 else "none", "turns": int(s.turn)}
@@ -93,9 +99,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", required=True, help="starting checkpoint (behaviour cloning or PPO)")
     ap.add_argument("--iterations", type=int, default=100)
-    ap.add_argument("--games-per-iter", type=int, default=32)
+    ap.add_argument("--games-per-iter", type=int, default=64)
     ap.add_argument("--sims", type=int, default=128)
     ap.add_argument("--c-puct", type=float, default=1.5)
+    ap.add_argument("--full-prob", type=float, default=0.25,
+                    help="fraction of decisions searched with --sims and used as policy targets (1 = all)")
+    ap.add_argument("--fast-sims", type=int, default=32, help="simulations of the other decisions")
+    ap.add_argument("--score-coef", type=float, default=1.0, help="weight of the auxiliary card-fraction loss")
     ap.add_argument("--history", type=int, default=2, help="opponents' last moves given to the network (trail planes)")
     ap.add_argument("--belief-coef", type=float, default=0.5, help="weight of the opponent-model loss")
     ap.add_argument("--belief-eps", type=float, default=0.1, help="uniform mixing of the belief used by the search")
@@ -104,7 +114,7 @@ def main(argv=None):
     ap.add_argument("--max-turns", type=int, default=200)
     ap.add_argument("--buffer", type=int, default=150_000)
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--reuse", type=float, default=4.0, help="times each new sample is seen in training")
+    ap.add_argument("--reuse", type=float, default=8.0, help="times each new sample is seen in training")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count()))
     ap.add_argument("--eval-every", type=int, default=5)
@@ -142,7 +152,8 @@ def main(argv=None):
     pool = ctx.Pool(args.workers, initializer=_worker_init)
     rng = np.random.default_rng(args.seed)
     t0, best = time.time(), -1.0
-    a = {k: getattr(args, k) for k in ("sims", "greedy_prob", "temp_decisions", "max_turns", "c_puct", "belief_eps")}
+    a = {k: getattr(args, k) for k in ("sims", "greedy_prob", "temp_decisions", "max_turns", "c_puct", "belief_eps",
+                                    "full_prob", "fast_sims")}
     try:
         for it in range(1, args.iterations + 1):
             jobs = [(int(rng.integers(2**31)), str(ckpt), it, a) for _ in range(args.games_per_iter)]
@@ -153,7 +164,8 @@ def main(argv=None):
                 summaries.append(summ)
             steps = max(1, int(new * args.reuse / args.batch))
             net.to(device)
-            m = train_steps(net, opt, buf, steps, args.batch, device, belief_coef=args.belief_coef, rng=rng)
+            m = train_steps(net, opt, buf, steps, args.batch, device, belief_coef=args.belief_coef,
+                            score_coef=args.score_coef, rng=rng)
             net.cpu()
             if it >= 3:  # from now on the search samples opponents' targets from the belief head
                 ck_args["belief_trained"] = True
@@ -162,7 +174,7 @@ def main(argv=None):
             row = {"iteration": it, "time": time.time() - t0, "samples": new, "buffer": buf.size, "train_steps": steps,
                    "policy_loss": m["policy_loss"], "value_loss": m["value_loss"], "net_best_eq_search_best": m["top1_exact"],
                    "kl_search_vs_net": m["kl_target_net"],
-                   "belief_loss": m["belief_loss"], "belief_top1": m["belief_top1"],
+                   "score_loss": m["score_loss"], "belief_loss": m["belief_loss"], "belief_top1": m["belief_top1"],
                    "belief_used": bool(ck_args.get("belief_trained")),
                    "game_length_turns": float(np.mean([s["turns"] for s in summaries])),
                    "selfplay_mcts_win_share_vs_greedy_seats": float(np.mean(

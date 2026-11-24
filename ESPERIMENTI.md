@@ -60,30 +60,33 @@ Se si interrompe, puoi ripartire con `--init runs/az/latest.pt` e una nuova `--o
 
 ---
 
-## Passo 3b: AlphaZero con modello degli avversari e ricerca più profonda
-Rispetto al passo 3 cambiano tre cose, tutte attive di default:
-- **memoria**: la rete vede dove ogni avversario ha iniziato le sue ultime 2 mosse (`--history 2`). Le scie si azzerano quando l'avversario raccoglie un tesoro, perché da lì cerca un tesoro nuovo;
-- **modello degli avversari**: una nuova testa della rete ("belief") predice quale tesoro sta cercando ogni avversario. Dalla terza iterazione la ricerca usa questa previsione per immaginare le carte nascoste, invece di sceglierle a caso;
-- **ricerca più profonda**: 128 simulazioni per mossa (prima 32).
+## Passo 3b: AlphaZero completo (la run principale per il modello finale)
+Rispetto al passo 3 ci sono queste aggiunte, tutte attive di default:
+- **memoria**: la rete vede dove ogni avversario ha iniziato le sue ultime 2 mosse (`--history 2`). Le scie si azzerano quando l'avversario raccoglie un tesoro;
+- **modello degli avversari**: una testa della rete ("belief") predice quale tesoro sta cercando ogni avversario, e la ricerca la usa per immaginare le carte nascoste invece di sceglierle a caso;
+- **ricerca più profonda**: 128 simulazioni per le decisioni "piene";
+- **simulazioni a budget variabile** (KataGo): solo il 25% delle decisioni usa la ricerca piena e diventa esempio per la policy (`--full-prob 0.25`). Le altre usano 32 simulazioni (`--fast-sims 32`) e allenano solo valore, punteggio e belief. Le partite sono circa 3 volte più veloci;
+- **riuso dell'albero**: dopo l'inserimento, la ricerca per il movimento riparte dal sottoalbero già esplorato;
+- **obiettivo ausiliario sul punteggio**: la rete predice anche la frazione di carte che ogni giocatore raccoglierà (`--score-coef 1.0`). È un segnale più ricco di vinto/perso.
 
-Si parte dalla stessa rete del passo 1: il checkpoint viene allargato da solo, e all'inizio gioca esattamente come prima.
+Prima rifai il passo 1 con il codice nuovo (il `dataset.npz` vecchio non è compatibile con le scie), poi:
 ```bash
-python -m train.alphazero --init runs/bc/final.pt --iterations 60 --games-per-iter 32 --sims 128 \
-    --eval-every 5 --eval-games 32 --eval-sims 128 --out runs/az_belief
+python -m train.behavior_cloning --games 20000 --epochs 8 --out runs/bc2
+python -m train.alphazero --init runs/bc2/final.pt --iterations 40 --games-per-iter 64 --sims 128 --fast-sims 32 \
+    --full-prob 0.25 --reuse 8 --eval-every 5 --eval-games 48 --eval-sims 128 --out runs/az2
 ```
-Ogni iterazione costa circa 4 volte quella del passo 3. Se è troppo lenta, usa `--sims 64`.
+Un checkpoint BC vecchio funziona comunque: le parti nuove della rete vengono aggiunte da sole.
 
 **Da guardare**, oltre alle metriche del passo 3:
 - `belief_top1`: quante volte la rete indovina l'obiettivo di un avversario. A caso si indovina circa l'8%, una regola semplice ("si è avvicinato a quel tesoro") arriva al 19%;
-- `net_best_eq_search_best`: quante volte la mossa preferita dalla rete è anche la più visitata dalla ricerca; `kl_search_vs_net`: quanto la distribuzione della ricerca si allontana da quella della rete. Se il primo sale e il secondo scende nel tempo, la rete sta assorbendo ciò che la ricerca scopre. (Il vecchio `top1_match_search` contava solo se la mossa della rete riceveva almeno una visita, quindi era sempre vicino al 99% e non diceva nulla.)
+- `net_best_eq_search_best`: quante volte la mossa preferita dalla rete è anche la più visitata dalla ricerca; `kl_search_vs_net`: quanto la ricerca si allontana dalla rete. Se il primo sale e il secondo scende nel tempo, la rete sta assorbendo ciò che la ricerca scopre. (Il vecchio `top1_match_search` contava solo se la mossa della rete riceveva almeno una visita, quindi era sempre vicino al 99% e non diceva nulla.)
+- `value_loss` e `score_loss`: devono scendere. Un predittore costante ha `value_loss` di circa 0,33.
 
 **Ablazione** (quanto conta il modello degli avversari), a parità di rete:
 ```bash
-python -m train.evaluate --agent mcts:runs/az_belief/best.pt:128 --opponent greedy --games 100
-python -m train.evaluate --agent mcts:runs/az_belief/best.pt:128:nobelief --opponent greedy --games 100
+python -m train.evaluate --agent mcts:runs/az2/best.pt:128 --opponent greedy --games 100
+python -m train.evaluate --agent mcts:runs/az2/best.pt:128:nobelief --opponent greedy --games 100
 ```
-
-Nota: un `dataset.npz` vecchio non è compatibile con `--history 2`. Se rifai il passo 1 da zero, lascialo rigenerare (oppure usa `--history 0`).
 
 ---
 

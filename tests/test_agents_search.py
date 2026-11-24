@@ -37,7 +37,8 @@ def test_sample_buffer_roundtrip(tmp_path):
     buf.add(obs, pi, np.array([1, -1 / 3, -1 / 3, -1 / 3], np.float32), np.array([5, 7, -1], np.int8))
     buf.save(tmp_path / "d.npz")
     b2 = SampleBuffer.load(tmp_path / "d.npz")
-    planes, vec, mask, p, z, opp = b2.batch(np.array([0]))
+    planes, vec, mask, p, z, opp, score = b2.batch(np.array([0]))
+    assert score[0].tolist() == [-1, -1, -1, -1]
     assert opp[0].tolist() == [5, 7, -1]
     assert np.array_equal(planes[0].numpy(), obs["planes"])
     assert np.array_equal(mask[0].numpy(), obs["action_mask"])
@@ -100,7 +101,7 @@ def test_checkpoint_upgrade_keeps_behaviour(tmp_path):
     from train.model import load_checkpoint, obs_config_from_args
     from labyrinth.observation import encode
     net = build_net({"blocks": 1}).eval()
-    torch.save({"model": {k: v for k, v in net.state_dict().items() if not k.startswith("belief_head")},
+    torch.save({"model": {k: v for k, v in net.state_dict().items() if not k.startswith(("belief_head", "score_head"))},
                 "args": {"blocks": 1}}, tmp_path / "old.pt")
     new, args = load_checkpoint(tmp_path / "old.pt", overrides={"history": 2})
     assert not new.belief_trained and args["history"] == 2
@@ -113,3 +114,20 @@ def test_checkpoint_upgrade_keeps_behaviour(tmp_path):
         a = net(t(o_old, "planes", torch.float32), t(o_old, "vector", torch.float32), t(o_old, "action_mask", torch.bool))
         b = new(t(o_new, "planes", torch.float32), t(o_new, "vector", torch.float32), t(o_new, "action_mask", torch.bool))
     assert torch.allclose(a[0], b[0], atol=1e-5) and torch.allclose(a[1], b[1], atol=1e-5)
+
+
+def test_tree_reuse_from_shift_to_move():
+    net = build_net({"blocks": 1}).eval()
+    env = LabyrinthEnv(max_turns=50)
+    obs, _ = env.reset(seed=3)
+    ag = MCTSAgent(net, sims=12, max_turns=50, seed=0)
+    a = ag.act(obs, env.state, 0)
+    assert a < 48 and ag._kept is not None
+    kept = ag._kept[1]
+    before = kept.N
+    obs, *_ = env.step(a)
+    b = ag.act(obs, env.state, 0)
+    assert b >= 48
+    if obs["action_mask"].sum() > 1:  # a forced move is played without searching
+        assert ag.mcts.root is kept and kept.N >= before + 12
+    assert abs(ag.last_pi.sum() - 1) < 1e-5 and obs["action_mask"][b]

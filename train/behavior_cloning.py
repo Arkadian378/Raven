@@ -23,7 +23,7 @@ from labyrinth.agents import GreedyAgent
 from labyrinth.core import NUM_ACTIONS
 from labyrinth.env import LabyrinthEnv
 from labyrinth.observation import ObservationConfig
-from train.data import SampleBuffer, ego, opponent_targets, outcome_vector, train_steps
+from train.data import SampleBuffer, ego, opponent_targets, outcome_vector, score_vector, train_steps
 from train.model import build_net
 
 
@@ -55,7 +55,9 @@ def play_expert_game(job):
             break
     z = outcome_vector(env.state)
     n = env.num_players
-    return [(o, pi, ego(z, p, n), opp) for o, pi, p, opp in records if pi is not None], env.state.turn
+    sc = score_vector(env.state)
+    return [(o, pi, ego(z, p, n), opp, ego(sc, p, n, empty=-1.0))
+            for o, pi, p, opp in records if pi is not None], env.state.turn
 
 
 def evaluate_policy(net, cfg, games=24, opponent="greedy", seed=50_000):
@@ -145,7 +147,7 @@ def main(argv=None):
         m = train_steps(net, _Opt(), buf, steps_per_epoch, args.batch, device, rng=rng)
         wr, cf = evaluate_policy(net.cpu(), cfg, args.eval_games)
         net.to(device)
-        row = {"epoch": ep, "policy_loss": m["policy_loss"], "value_loss": m["value_loss"],
+        row = {"epoch": ep, "policy_loss": m["policy_loss"], "value_loss": m["value_loss"], "score_loss": m["score_loss"],
                "top1_in_expert_set": m["top1"], "belief_loss": m["belief_loss"], "belief_top1": m["belief_top1"],
                "win_rate_vs_greedy": wr, "cards_frac_vs_greedy": cf, "time": time.time() - t0}
         print(json.dumps(row), flush=True)

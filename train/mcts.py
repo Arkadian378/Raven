@@ -18,6 +18,9 @@
   determinisation samples the opponents' current targets from the network's
   belief (mixed with a little uniform noise) instead of uniformly, so the
   search plans against what the opponents are most likely trying to reach.
+* **Tree reuse.** After an insertion is chosen, the subtree below it (which
+  already holds the batched evaluation of every move and the visits spent
+  on them) becomes the root of the following move decision.
 * **PUCT** selection with the network policy as prior, Dirichlet noise at the
   root for self-play exploration, and visit-count based action selection.
 """
@@ -106,11 +109,20 @@ class MCTS:
         node.children = {int(a): Node(float(p)) for a, p in zip(legal, pr)}
 
     # -------------------------------------------------------------- search
-    def search(self, state: GameState, add_noise: bool = False) -> np.ndarray:
+    def search(self, state: GameState, add_noise: bool = False, root: Node | None = None) -> np.ndarray:
         """Run the search from ``state`` (as seen by the player to act) and
-        return the visit distribution over the 97 actions."""
+        return the visit distribution over the 97 actions. ``root`` may be a
+        subtree kept from the previous decision of the same player."""
         observer = state.current
-        root = Node()
+        if root is None or root.children is None or root.player != observer:
+            root = Node()
+        elif add_noise:
+            legal = list(root.children)
+            noise = self.rng.dirichlet([self.alpha] * len(legal))
+            for a, eta in zip(legal, noise):
+                c = root.children[a]
+                c.prior = (1 - self.noise_frac) * c.prior + self.noise_frac * float(eta)
+        self.root = root
         base = state.clone()
         base.history = []
         beliefs = self.opponent_beliefs(base, observer) if self.determinize and self.belief else None
@@ -132,6 +144,9 @@ class MCTS:
             for n in path:
                 n.N += 1
                 n.W = value.astype(np.float64) if n.W is None else n.W + value
+        if root.children is None:  # zero simulations: expand once
+            mask, prior, _ = self.evaluate(base)
+            self._expand(root, base, mask, prior)
         visits = np.zeros(NUM_ACTIONS, np.float32)
         for a, child in root.children.items():
             visits[a] = child.N - child.N0
@@ -176,24 +191,40 @@ class MCTS:
 class MCTSAgent:
     """Agent interface (``act(obs, state, player)``) on top of :class:`MCTS`."""
 
-    def __init__(self, net, sims: int = 200, temperature: float = 0.0, **kw):
+    def __init__(self, net, sims: int = 200, temperature: float = 0.0, reuse_tree: bool = True, **kw):
         self.mcts = MCTS(net, sims=sims, **kw)
         self.temperature = temperature
+        self.reuse_tree = reuse_tree
         self.name = f"mcts{sims}"
         self.last_pi = None
+        self._kept = None  # (state key, subtree) kept from the insertion just chosen
+
+    @staticmethod
+    def _key(s: GameState):
+        return (s.turn, s.current, s.phase, s.board.tobytes(), s.pos.tobytes(), s.spare, s.last_slot)
 
     def act(self, obs, state: GameState, player: int | None = None, add_noise: bool = False) -> int:
         legal = np.flatnonzero(obs["action_mask"])
+        kept, self._kept = self._kept, None
+        root = kept[1] if kept is not None and kept[0] == self._key(state) else None
         if len(legal) == 1:
             self.last_pi = np.eye(NUM_ACTIONS, dtype=np.float32)[legal[0]]
             return int(legal[0])
-        pi = self.mcts.search(state, add_noise=add_noise)
+        pi = self.mcts.search(state, add_noise=add_noise, root=root)
         self.last_pi = pi
         if self.temperature > 0:
             p = pi ** (1 / self.temperature)
-            return int(self.mcts.rng.choice(NUM_ACTIONS, p=p / p.sum()))
-        top = np.flatnonzero(pi == pi.max())
-        return int(self.mcts.rng.choice(top))
+            a = int(self.mcts.rng.choice(NUM_ACTIONS, p=p / p.sum()))
+        else:
+            top = np.flatnonzero(pi == pi.max())
+            a = int(self.mcts.rng.choice(top))
+        if self.reuse_tree and state.phase == 0:  # keep the subtree for this player's move decision
+            child = self.mcts.root.children.get(a)
+            if child is not None and child.children is not None:
+                nxt = state.clone()
+                nxt.step(a)
+                self._kept = (self._key(nxt), child)
+        return a
 
 
 class NetAgent:

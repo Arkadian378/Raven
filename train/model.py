@@ -57,6 +57,8 @@ class LabyrinthNet(nn.Module):
         self.trunk = nn.Sequential(nn.Linear(channels * 49 + vec_dim, hidden), nn.ReLU())
         self.shift_head = nn.Linear(hidden, NUM_SHIFT)
         self.value_head = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, MAX_PLAYERS))
+        # auxiliary: final fraction of cards found by every seat (ego order), in [0, 1]
+        self.score_head = nn.Sequential(nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Linear(hidden // 2, MAX_PLAYERS))
         self.belief_index = belief_index  # positions of treasure features in the input (see build_net)
         self.belief_head = nn.ModuleDict({
             "cell": nn.Conv2d(channels, MAX_PLAYERS - 1, 1),         # where is each opponent heading
@@ -75,15 +77,19 @@ class LabyrinthNet(nn.Module):
         logits, values, _ = self.forward_full(planes, vector, mask)
         return logits, values
 
-    def forward_full(self, planes, vector, mask):
-        """Also returns the opponent-target belief logits (B,3,24)."""
+    def forward_full(self, planes, vector, mask, with_score: bool = False):
+        """Also returns the opponent-target belief logits (B,3,24) and, if
+        asked, the predicted final card fractions (B,4)."""
         x = self.stem(planes) + self.vec_in(vector)[:, :, None, None]
         x = self.tower(x)
         move_logits = self.move_head(x).flatten(1)                     # (B,49)
         h = self.trunk(torch.cat([x.flatten(1), vector], dim=1))
         logits = torch.cat([self.shift_head(h), move_logits], dim=1)   # (B,97)
         logits = logits.masked_fill(~mask, -1e9)
-        return logits, self.value_head(h), self._belief(x, h, planes, vector)
+        out = (logits, self.value_head(h), self._belief(x, h, planes, vector))
+        if with_score:
+            out = out + (torch.sigmoid(self.score_head(h)),)
+        return out
 
     def _belief(self, x, h, planes, vector):
         bh = self.belief_head
@@ -149,8 +155,8 @@ def load_checkpoint(path, device="cpu", overrides: dict | None = None):
                 raise ValueError(f"{path}: incompatible parameter {k} {tuple(v.shape)} vs {tuple(own[k].shape)}")
             state[k] = fixed
     missing, unexpected = net.load_state_dict(state, strict=False)
-    if unexpected or any(not k.startswith("belief_head") for k in missing):
+    if unexpected or any(not k.startswith(("belief_head", "score_head")) for k in missing):
         raise ValueError(f"{path}: missing {missing}, unexpected {unexpected}")
-    net.belief_trained = bool(args.get("belief_trained", False)) and not missing
+    net.belief_trained = bool(args.get("belief_trained", False)) and not any(k.startswith("belief_head") for k in missing)
     net.eval()
     return net, args
